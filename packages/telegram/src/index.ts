@@ -154,7 +154,9 @@ function gate(ctx: Context): "allow" | "pair" | "deny" {
       const text = ctx.message?.text ?? ctx.message?.caption ?? ""
       const patterns = access.mentionPatterns ?? []
       const mentioned = patterns.some((p) => text.includes(p))
-      if (!mentioned) return "deny"
+      // Also allow replies to the bot's own messages
+      const replyToBot = ctx.message?.reply_to_message?.from?.id === bot.botInfo?.id
+      if (!mentioned && !replyToBot) return "deny"
     }
 
     // Check group allowFrom
@@ -173,12 +175,31 @@ function gate(ctx: Context): "allow" | "pair" | "deny" {
 
 // ── Session management ──────────────────────────────────────────────────────
 
-const chatSessions = new Map<string, string>() // chatId -> sessionId
+// msgId -> sessionId: tracks which bot reply belongs to which session
+// When bot replies, we store botReplyMsgId -> sessionId
+// When user replies to a bot message, we look up the session
+const msgSessions = new Map<string, string>() // `${chatId}:${botMsgId}` -> sessionId
+
+// Per-chat message queue to ensure sequential processing
+const chatQueues = new Map<string, Promise<void>>()
+
+function enqueue(chatId: string, fn: () => Promise<void>): void {
+  const prev = chatQueues.get(chatId) ?? Promise.resolve()
+  const next = prev.then(fn, fn) // run fn after previous completes (even if it failed)
+  chatQueues.set(chatId, next)
+  // Clean up reference when done
+  next.then(() => {
+    if (chatQueues.get(chatId) === next) chatQueues.delete(chatId)
+  })
+}
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
 console.log("Starting opencode server...")
-const opencode = await createOpencode({ port: 0 })
+const opencodeConfig = JSON.parse(
+  readFileSync(join(process.env.HOME ?? homedir(), "opencode.json"), "utf8")
+)
+const opencode = await createOpencode({ port: 0, config: opencodeConfig })
 console.log("Opencode server ready")
 
 const bot = new Bot(TOKEN)
@@ -204,8 +225,9 @@ pollApproved(bot)
       const part = event.properties.part
       if (part.type === "tool" && part.state.status === "completed") {
         // Find chat for this session and send tool update
-        for (const [chatId, sessionId] of chatSessions.entries()) {
+        for (const [key, sessionId] of msgSessions.entries()) {
           if (sessionId === part.sessionID) {
+            const chatId = key.split(":")[0]!
             const toolMsg = `🔧 ${part.tool} — ${part.state.title ?? "done"}`
             await bot.api.sendMessage(chatId, toolMsg).catch(() => {})
             break
@@ -222,6 +244,7 @@ async function handleMessage(ctx: Context, text: string) {
   const chatId = String(ctx.chat?.id ?? "")
   const senderId = String(ctx.from?.id ?? "")
 
+  // Gate checks are immediate (no queue needed)
   if (gateResult === "deny") return
   if (gateResult === "pair") {
     const msg = handlePairing(senderId, chatId)
@@ -229,8 +252,40 @@ async function handleMessage(ctx: Context, text: string) {
     return
   }
 
-  // Get or create session
-  let sessionId = chatSessions.get(chatId)
+  // Queue the actual processing per chat to avoid concurrent prompts
+  enqueue(chatId, () => processMessage(ctx, text, chatId, senderId))
+}
+
+async function processMessage(ctx: Context, text: string, chatId: string, senderId: string) {
+  const replyTo = ctx.message?.reply_to_message
+  const replyToBot = replyTo?.from?.id === bot.botInfo?.id
+  const msgId = ctx.message?.message_id
+
+  // React immediately to acknowledge receipt
+  if (msgId) {
+    await bot.api.setMessageReaction(chatId, msgId, [{ type: "emoji", emoji: "👀" }]).catch(() => {})
+  }
+
+  // Determine session: reply to bot = continue, otherwise = new session
+  let sessionId: string | undefined
+  if (replyToBot && replyTo) {
+    const key = `${chatId}:${replyTo.message_id}`
+    sessionId = msgSessions.get(key)
+  }
+
+  // For DMs: also try continuing the last session for this chat if not a reply
+  // (DMs are usually a single conversation thread)
+  if (!sessionId && ctx.chat?.type === "private") {
+    // Find most recent session for this chat
+    for (const [key, sid] of msgSessions.entries()) {
+      if (key.startsWith(`${chatId}:`)) {
+        sessionId = sid
+        // Don't break — we want the latest one (Map preserves insertion order)
+      }
+    }
+  }
+
+  // No existing session found → create new one
   if (!sessionId) {
     const username = ctx.from?.username ?? ctx.from?.first_name ?? "unknown"
     const chatTitle =
@@ -242,17 +297,16 @@ async function handleMessage(ctx: Context, text: string) {
       body: { title: chatTitle },
     })
     if (result.error) {
+      console.error("Session create error:", JSON.stringify(result.error))
       await ctx.reply("Failed to create session. Please try again.").catch(() => {})
       return
     }
     sessionId = result.data.id
-    chatSessions.set(chatId, sessionId)
   }
 
-  // Format message with metadata (like Claude Code's <channel> tag)
+  // Format message with metadata
   const username = ctx.from?.username ?? ctx.from?.first_name ?? "unknown"
   const ts = new Date().toISOString()
-  const msgId = ctx.message?.message_id
   const prompt = `<channel source="telegram" chat_id="${chatId}" message_id="${msgId}" user="${username}" user_id="${senderId}" ts="${ts}">\n${text}\n</channel>`
 
   // Send to opencode
@@ -262,6 +316,7 @@ async function handleMessage(ctx: Context, text: string) {
   })
 
   if (result.error) {
+    console.error("Prompt error:", JSON.stringify(result.error))
     await ctx.reply("Failed to process message. Please try again.").catch(() => {})
     return
   }
@@ -281,7 +336,16 @@ async function handleMessage(ctx: Context, text: string) {
   // Split long messages (Telegram 4096 char limit)
   const chunks = splitMessage(responseText, 4096)
   for (const chunk of chunks) {
-    await ctx.reply(chunk, { reply_to_message_id: msgId }).catch(() => {})
+    const sent = await ctx.reply(chunk, { reply_to_message_id: msgId }).catch(() => undefined)
+    // Map each bot reply message to this session so user can reply to continue
+    if (sent) {
+      msgSessions.set(`${chatId}:${sent.message_id}`, sessionId!)
+    }
+  }
+
+  // Clear the "processing" reaction
+  if (msgId) {
+    await bot.api.setMessageReaction(chatId, msgId, []).catch(() => {})
   }
 }
 
